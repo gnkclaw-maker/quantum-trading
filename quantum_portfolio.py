@@ -64,7 +64,12 @@ rng = np.random.default_rng(SEED)
 # ---------------- universes ----------------
 def get_sp500():
     """Fetch current S&P 500 constituents + GICS sectors from Wikipedia."""
-    df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    import io, urllib.request
+    req = urllib.request.Request(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        headers={"User-Agent": "Mozilla/5.0 (quantum-trading; research bot)"})
+    html = urllib.request.urlopen(req, timeout=30).read()
+    df = pd.read_html(io.BytesIO(html))[0]
     tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
     sectors = dict(zip(tickers, df["GICS Sector"]))
     return tickers, sectors
