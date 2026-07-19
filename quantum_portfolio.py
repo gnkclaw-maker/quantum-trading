@@ -20,7 +20,8 @@ Solvers:
 Examples:
   python3 quantum_portfolio.py --universe stocks
   python3 quantum_portfolio.py --universe crypto --budget 8000 --lambda 1.5
-  python3 quantum_portfolio.py --universe commodities --max-positions 4 --sector-cap 0.5
+  python3 quantum_portfolio.py --universe sp500 --screen 60 --budget 50000 \
+      --max-positions 10 --sector-cap 0.35
   python3 quantum_portfolio.py --tickers AAPL MSFT NVDA --solver neal
   python3 quantum_portfolio.py --universe stocks --solver dwave   # real QPU
 """
@@ -60,16 +61,112 @@ SEED = 7
 rng = np.random.default_rng(SEED)
 
 
+# ---------------- universes ----------------
+def get_sp500():
+    """Fetch current S&P 500 constituents + GICS sectors from Wikipedia."""
+    df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+    sectors = dict(zip(tickers, df["GICS Sector"]))
+    return tickers, sectors
+
+
 # ---------------- data ----------------
 def get_data(tickers, lookback):
+    """Returns px, mu, cov, surviving_tickers (drops tickers with gaps)."""
     import yfinance as yf
     px = yf.download(tickers, period=lookback, interval="1d",
                      auto_adjust=True, progress=False)["Close"]
     if isinstance(px, pd.Series):
         px = px.to_frame(tickers[0])
-    px = px.dropna()
+    px = px.dropna(axis=1, thresh=max(30, int(0.98 * len(px)))).dropna()
+    alive = [t for t in tickers if t in px.columns]
+    dropped = [t for t in tickers if t not in alive]
+    if dropped:
+        print(f"  (dropped {len(dropped)} tickers with insufficient history)")
+    px = px[alive]
     rets = px.pct_change().dropna()
-    return px, rets.mean().values * 252, rets.cov().values * 252
+    return px, rets.mean().values * 252, rets.cov().values * 252, alive
+
+
+def rsi(px, period=14):
+    """Wilder RSI on a price series (last value)."""
+    d = px.diff()
+    up = d.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / dn.replace(0, np.nan)
+    return float((100 - 100 / (1 + rs)).iloc[-1])
+
+
+def technical_score(tickers, px, mu, cov):
+    """Composite technical score per ticker: momentum trend, RSI-50 distance,
+    risk-adjusted return. Returns (scores array, details dict)."""
+    vol = np.sqrt(np.diag(cov))
+    sharpe = np.divide(mu, vol, out=np.full_like(mu, -9e9), where=vol > 0)
+    scores, details = np.zeros(len(tickers)), {}
+    for j, t in enumerate(tickers):
+        p = px[t]
+        sma50 = p.rolling(50).mean().iloc[-1]
+        sma200 = p.rolling(200).mean().iloc[-1] if len(p) >= 200 else np.nan
+        trend = (p.iloc[-1] / sma50 - 1) * 100
+        golden = 1.0 if (not np.isnan(sma200) and sma50 > sma200) else (
+                 -1.0 if not np.isnan(sma200) else 0.0)
+        r = rsi(p)
+        rsi_term = (r - 50) / 25          # >0 overbought-momentum zone, clipped
+        mom = np.tanh(sharpe[j])          # bounded risk-adjusted return
+        score = 0.45 * mom + 0.35 * np.tanh(trend / 10) + 0.2 * np.clip(rsi_term, -1, 1) + 0.1 * golden
+        scores[j] = score
+        details[t] = {"rsi": r, "trend_50d": trend,
+                      "above_200dma": bool(golden > 0) if not np.isnan(sma200) else None,
+                      "tech_score": score}
+    return scores, details
+
+
+def fundamental_score(tickers):
+    """Composite fundamental score via yfinance .info: growth, profitability,
+    valuation, leverage. Missing data -> neutral 0."""
+    import yfinance as yf
+    scores, details = {}, {}
+    for t in tickers:
+        try:
+            info = yf.Ticker(t).info
+            rev_g = info.get("revenueGrowth")          # e.g. 0.15
+            pm = info.get("profitMargins")             # e.g. 0.25
+            roe = info.get("returnOnEquity")
+            pe = info.get("forwardPE")
+            peg = info.get("pegRatio")
+            dte = info.get("debtToEquity")             # percent
+            f = 0.0; n = 0
+            if rev_g is not None: f += 0.30 * np.tanh(rev_g / 0.20); n += 1
+            if pm is not None:    f += 0.25 * np.tanh(pm / 0.20);    n += 1
+            if roe is not None:   f += 0.20 * np.tanh(roe / 0.20);   n += 1
+            if pe:                f += 0.10 * np.tanh((25 - pe) / 25); n += 1
+            if peg:               f += 0.10 * np.tanh((2 - peg) / 2);  n += 1
+            if dte is not None:   f += 0.05 * np.tanh((100 - dte) / 100); n += 1
+            s = float(f) if n else 0.0
+            scores[t] = s
+            details[t] = {"rev_growth": rev_g, "profit_margin": pm,
+                          "forward_pe": pe, "debt_to_eq": dte, "fund_score": s}
+        except Exception:
+            scores[t] = 0.0
+            details[t] = {"fund_score": 0.0}
+    return np.array([scores[t] for t in tickers]), details
+
+
+def screen(tickers, px, mu, cov, n_keep, w_tech=0.5, w_fund=0.5):
+    """Rank universe by combined technical + fundamental score, keep top n_keep.
+    Shrinks the universe classically so the QUBO handles the constrained
+    combinatorics on the quality names."""
+    print(f"  scoring {len(tickers)} tickers (technical {w_tech:.0%} + "
+          f"fundamental {w_fund:.0%})...")
+    tech, tech_d = technical_score(tickers, px, mu, cov)
+    fund, fund_d = fundamental_score(tickers)
+    combined = w_tech * tech + w_fund * fund
+    details = {}
+    for j, t in enumerate(tickers):
+        details[t] = {**tech_d[t], **fund_d[t], "combined": float(combined[j])}
+    keep = np.sort(np.argsort(-combined)[:n_keep])
+    ranked = sorted(details.items(), key=lambda kv: -kv[1]["combined"])
+    return keep, ranked
 
 
 # ---------------- QUBO construction ----------------
@@ -245,8 +342,16 @@ def describe(x, meta, tickers, mu, cov, lot_value):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--universe", choices=list(UNIVERSES), default="stocks")
+    ap.add_argument("--universe", choices=list(UNIVERSES) + ["sp500"], default="stocks")
     ap.add_argument("--tickers", nargs="+", help="custom tickers (overrides universe)")
+    ap.add_argument("--screen", type=int, default=None,
+                    help="pre-screen universe to top N by tech+fundamental score")
+    ap.add_argument("--tech-weight", type=float, default=0.5,
+                    help="weight of technical score in screening (rest = fundamentals)")
+    ap.add_argument("--fractional", action="store_true",
+                    help="fractional shares: allocate exact $ instead of whole lots")
+    ap.add_argument("--min-position", type=float, default=100,
+                    help="min $ per position (fractional mode)")
     ap.add_argument("--lookback", default="1y")
     ap.add_argument("--budget", type=float, default=12000, help="capital in $")
     ap.add_argument("--lot-value", type=float, default=1000)
@@ -269,19 +374,47 @@ def main():
     global LOT_VALUE_DEFAULT
     LOT_VALUE_DEFAULT = args.lot_value
 
-    uni = UNIVERSES[args.universe]
-    tickers = args.tickers or uni["tickers"]
-    sectors = uni["sectors"] if not args.tickers else None
+    uni = UNIVERSES.get(args.universe)
+    if args.universe == "sp500":
+        print("Fetching S&P 500 constituents...")
+        tickers, sectors = get_sp500()
+    else:
+        tickers = args.tickers or uni["tickers"]
+        sectors = uni["sectors"] if not args.tickers else None
 
+    # auto lot size: make lots granular enough relative to capital
+    if args.fractional:
+        target_lots = max(10 * args.max_positions if args.max_positions else 30, 30)
+        args.lot_value = max(args.min_position,
+                             round(args.budget / target_lots, 2))
     budget_lots = int(args.budget // args.lot_value)
     print(f"Universe: {args.universe} ({len(tickers)} assets) | "
-          f"budget ${args.budget:,.0f} = {budget_lots} lots | "
+          f"budget ${args.budget:,.0f} = {budget_lots} lots x ${args.lot_value:,.0f} | "
           f"lambda={args.lam}"
           + (f" | max {args.max_positions} positions" if args.max_positions else "")
           + (f" | sector cap {args.sector_cap:.0%}" if args.sector_cap else ""))
 
     print(f"Downloading {args.lookback} of daily data...")
-    px, mu, cov = get_data(tickers, args.lookback)
+    px, mu, cov, tickers = get_data(tickers, args.lookback)
+    if sectors:
+        sectors = {t: sectors[t] for t in tickers}
+    ranked = None
+    if args.screen and len(tickers) > args.screen:
+        keep, ranked = screen(tickers, px, mu, cov, args.screen,
+                              w_tech=args.tech_weight, w_fund=1 - args.tech_weight)
+        tickers = [tickers[i] for i in keep]
+        mu, cov = mu[keep], cov[np.ix_(keep, keep)]
+        px = px[tickers]
+        if sectors:
+            sectors = {t: sectors[t] for t in tickers}
+        ranked = ranked[:args.screen]
+        print(f"Pre-screened to top {len(tickers)}:")
+        for t, d in ranked[:10]:
+            print(f"   {t:6s} score {d['combined']:+.2f} "
+                  f"(tech {d['tech_score']:+.2f}, fund {d['fund_score']:+.2f}, "
+                  f"RSI {d['rsi']:.0f}, trend {d['trend_50d']:+.1f}%)")
+        if len(ranked) > 10:
+            print(f"   ... and {len(ranked)-10} more")
 
     current = None
     if args.current_holdings:
