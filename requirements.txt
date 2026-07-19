@@ -1,0 +1,6 @@
+numpy
+pandas
+yfinance
+# optional solvers:
+# dwave-neal
+# dwave-system
