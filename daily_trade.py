@@ -22,6 +22,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).parent))
 import quantum_portfolio as qp
+import capitol_trades as ct
 
 ENV = Path.home() / ".openclaw/credentials/alpaca.env"
 
@@ -54,12 +55,26 @@ def order(symbol, qty, side="buy"):
 
 
 def run_pipeline(budget, max_positions, screen_n, sector_cap, lam, tech_weight,
-                 restarts):
+                 restarts, congress_weight=0.0):
     tickers, sectors = qp.get_sp500()
     px, mu, cov, tickers = qp.get_data(tickers, "1y")
     sectors = {t: sectors[t] for t in tickers}
+
+    congress_trades, extra = [], None
+    if congress_weight:
+        try:
+            congress_trades = ct.fetch_recent_trades()
+            signals = ct.congress_buy_signals(congress_trades)
+            extra = {t: congress_weight * s for t, s in signals.items()}
+            print(f"  congress signal: {len(congress_trades)} trades, "
+                  f"{len(signals)} tickers with buys (weight {congress_weight})",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"  congress signal unavailable: {e}", file=sys.stderr)
+
     keep, ranked = qp.screen(tickers, px, mu, cov, min(screen_n, len(tickers)),
-                             w_tech=tech_weight, w_fund=1 - tech_weight)
+                             w_tech=tech_weight, w_fund=1 - tech_weight,
+                             extra=extra)
     tickers = [tickers[i] for i in keep]
     mu, cov = mu[keep], cov[np.ix_(keep, keep)]
     px = px[tickers]
@@ -75,10 +90,10 @@ def run_pipeline(budget, max_positions, screen_n, sector_cap, lam, tech_weight,
     runs = [qp.simulated_quantum_anneal(Q) for _ in range(restarts)]
     x, e = min(runs, key=lambda r: r[1])
     port, nl, r, v = qp.describe(x, meta, tickers, mu, cov, lot_value)
-    return port, ranked, px, (r, v), (budget, budget_lots, lot_value)
+    return port, ranked, px, (r, v), (budget, budget_lots, lot_value), congress_trades
 
 
-def build_brief(port, ranked, px, stats, sizing, today):
+def build_brief(port, ranked, px, stats, sizing, today, congress_trades=None):
     r, v = stats
     budget, budget_lots, lot_value = sizing
     det = dict(ranked)
@@ -94,18 +109,28 @@ def build_brief(port, ranked, px, stats, sizing, today):
         shares = row["$"] / last
         trades.append({"symbol": t, "qty": round(shares, 4),
                        "notional": row["$"], "last": last})
+        cg = f" | 🏛️ {d['congress']:+.2f}" if d.get("congress") else ""
         lines.append(
             f"• **{t}** — ${row['$']:,.0f} (~{shares:.2f} sh @ {last:,.2f})"
             f" | score {d.get('combined', 0):+.2f} | RSI {d.get('rsi', 0):.0f}"
-            f" | trend {d.get('trend_50d', 0):+.1f}%")
+            f" | trend {d.get('trend_50d', 0):+.1f}%{cg}")
     deployed = port["$"].sum()
     lines.append(f"\nDeployed ${deployed:,.0f} of ${budget:,.0f} "
                  f"({deployed / budget:.0%}) | model E[ret] {r:+.1%}, "
                  f"vol {v:.1%}, Sharpe ~{r / v:.2f} (in-sample)")
+    if congress_trades:
+        notable = ct.summarize_buys(congress_trades, limit=5)
+        if notable:
+            lines.append("\n**🏛️ Recent Congress purchases** (STOCK Act disclosures)")
+            for t in notable:
+                lines.append(
+                    f"• **{t['ticker']}** — {t['politician']} ({t.get('chamber', '?')}) "
+                    f"bought {t['amount_range']} on {t['trade_date']}")
     lines.append("\n**Screen leaderboard**")
     for t, d in ranked[:8]:
+        cg = f" · 🏛️ {d['congress']:+.2f}" if d.get("congress") else ""
         lines.append(f"• {t}: {d['combined']:+.2f} (tech {d['tech_score']:+.2f}"
-                     f" · fund {d['fund_score']:+.2f} · RSI {d['rsi']:.0f})")
+                     f" · fund {d['fund_score']:+.2f} · RSI {d['rsi']:.0f}{cg})")
     lines.append("\n_Paper trading via Alpaca. Not investment advice._")
     return "\n".join(lines), trades
 
@@ -120,6 +145,9 @@ def main():
     ap.add_argument("--lam", type=float, default=2.5)
     ap.add_argument("--tech-weight", type=float, default=0.5)
     ap.add_argument("--restarts", type=int, default=6)
+    ap.add_argument("--congress-weight", type=float, default=0.1,
+                    help="additive weight of congress buy signal in screening "
+                         "(0 = disabled)")
     ap.add_argument("--trade", action="store_true",
                     help="place market orders on paper account")
     ap.add_argument("--out", default=None)
@@ -137,10 +165,11 @@ def main():
     print(f"[{dt.datetime.now():%H:%M:%S}] account cash=${float(acct['cash']):,.2f}, "
           f"market_open={clk['is_open']}", file=sys.stderr)
 
-    port, ranked, px, stats, sizing = run_pipeline(
+    port, ranked, px, stats, sizing, congress_trades = run_pipeline(
         budget, args.max_positions, args.screen, args.sector_cap, args.lam,
-        args.tech_weight, args.restarts)
-    brief, trades = build_brief(port, ranked, px, stats, sizing, today)
+        args.tech_weight, args.restarts, congress_weight=args.congress_weight)
+    brief, trades = build_brief(port, ranked, px, stats, sizing, today,
+                                congress_trades=congress_trades)
 
     print(brief)
     if args.out:

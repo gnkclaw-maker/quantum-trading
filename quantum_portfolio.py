@@ -157,18 +157,23 @@ def fundamental_score(tickers):
     return np.array([scores[t] for t in tickers]), details
 
 
-def screen(tickers, px, mu, cov, n_keep, w_tech=0.5, w_fund=0.5):
+def screen(tickers, px, mu, cov, n_keep, w_tech=0.5, w_fund=0.5, extra=None):
     """Rank universe by combined technical + fundamental score, keep top n_keep.
     Shrinks the universe classically so the QUBO handles the constrained
-    combinatorics on the quality names."""
+    combinatorics on the quality names.
+    extra: optional {ticker: additive score} overlay (e.g. congress buy signal)."""
     print(f"  scoring {len(tickers)} tickers (technical {w_tech:.0%} + "
           f"fundamental {w_fund:.0%})...")
     tech, tech_d = technical_score(tickers, px, mu, cov)
     fund, fund_d = fundamental_score(tickers)
     combined = w_tech * tech + w_fund * fund
+    if extra:
+        for j, t in enumerate(tickers):
+            combined[j] += extra.get(t, 0.0)
     details = {}
     for j, t in enumerate(tickers):
-        details[t] = {**tech_d[t], **fund_d[t], "combined": float(combined[j])}
+        details[t] = {**tech_d[t], **fund_d[t], "combined": float(combined[j]),
+                      "congress": float(extra.get(t, 0.0)) if extra else 0.0}
     keep = np.sort(np.argsort(-combined)[:n_keep])
     ranked = sorted(details.items(), key=lambda kv: -kv[1]["combined"])
     return keep, ranked
